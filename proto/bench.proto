@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package bench;
+
+option go_package = "github.com/ryskn/grpc-flow-bench/proto";
+
+service Bench {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc StreamPing(stream PingRequest) returns (stream PingResponse);
+}
+
+message PingRequest {
+  int64 seq = 1;
+  bytes payload = 2;
+}
+
+message PingResponse {
+  int64 seq = 1;
+  int64 server_ts_ns = 2;
+}
