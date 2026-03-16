@@ -17,11 +17,12 @@ import (
 )
 
 var (
-	target      = flag.String("target", "localhost:50051", "server address")
-	flows       = flag.Int("flows", 100, "number of concurrent flows (connections)")
-	duration    = flag.Duration("duration", 10*time.Second, "benchmark duration")
-	payloadSize = flag.Int("payload", 64, "payload size in bytes")
-	mode        = flag.String("mode", "unary", "mode: unary or stream")
+	target       = flag.String("target", "localhost:50051", "server address")
+	flows        = flag.Int("flows", 100, "number of concurrent flows (connections)")
+	duration     = flag.Duration("duration", 10*time.Second, "benchmark duration")
+	payloadSize  = flag.Int("payload", 64, "payload size in bytes")
+	mode         = flag.String("mode", "unary", "mode: unary or stream")
+	setupTimeout = flag.Duration("setup-timeout", 30*time.Second, "timeout for stream setup phase")
 )
 
 type stats struct {
@@ -93,16 +94,11 @@ func runUnary(conn *pb.BenchClient, payload []byte, ctx context.Context, counter
 	}
 }
 
-func runStream(conn *pb.BenchClient, payload []byte, ctx context.Context, counter *int64, s *stats) {
-	stream, err := (*conn).StreamPing(ctx)
-	if err != nil {
-		log.Printf("stream open error: %v", err)
-		return
-	}
+func runStream(stream pb.Bench_StreamPingClient, payload []byte, benchCtx context.Context, counter *int64, s *stats) {
 	seq := int64(0)
 	for {
 		select {
-		case <-ctx.Done():
+		case <-benchCtx.Done():
 			stream.CloseSend()
 			return
 		default:
@@ -143,29 +139,78 @@ func main() {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), *duration+5*time.Second)
-	defer cancel()
-	benchCtx, benchCancel := context.WithTimeout(ctx, *duration)
-	defer benchCancel()
-
 	var counter int64
 	s := &stats{}
 	var wg sync.WaitGroup
 
-	start := time.Now()
-	for i := 0; i < *flows; i++ {
-		wg.Add(1)
-		go func(c pb.BenchClient) {
-			defer wg.Done()
-			if *mode == "stream" {
-				runStream(&c, payload, benchCtx, &counter, s)
-			} else {
-				runUnary(&c, payload, benchCtx, &counter, s)
-			}
-		}(clients[i])
-	}
+	if *mode == "stream" {
+		// Phase 1: establish all streams with a dedicated setup timeout
+		streamCtx, streamCancel := context.WithCancel(context.Background())
+		defer streamCancel()
 
-	wg.Wait()
-	elapsed := time.Since(start)
-	s.report(atomic.LoadInt64(&counter), elapsed)
+		streams := make([]pb.Bench_StreamPingClient, *flows)
+		var setupWg sync.WaitGroup
+		var setupErrors int64
+
+		fmt.Printf("Setting up %d streams (timeout: %s)...\n", *flows, *setupTimeout)
+		for i := 0; i < *flows; i++ {
+			setupWg.Add(1)
+			go func(i int, c pb.BenchClient) {
+				defer setupWg.Done()
+				stream, err := c.StreamPing(streamCtx)
+				if err != nil {
+					log.Printf("stream open error [%d]: %v", i, err)
+					atomic.AddInt64(&setupErrors, 1)
+					return
+				}
+				streams[i] = stream
+			}(i, clients[i])
+		}
+
+		setupDone := make(chan struct{})
+		go func() { setupWg.Wait(); close(setupDone) }()
+		select {
+		case <-setupDone:
+		case <-time.After(*setupTimeout):
+			fmt.Printf("Warning: setup timed out after %s\n", *setupTimeout)
+		}
+
+		if setupErrors > 0 {
+			fmt.Printf("Warning: %d/%d streams failed to open\n", setupErrors, *flows)
+		}
+
+		// Phase 2: run benchmark on established streams
+		benchCtx, benchCancel := context.WithTimeout(context.Background(), *duration)
+		defer benchCancel()
+
+		start := time.Now()
+		for i := 0; i < *flows; i++ {
+			if streams[i] == nil {
+				continue
+			}
+			wg.Add(1)
+			go func(stream pb.Bench_StreamPingClient) {
+				defer wg.Done()
+				runStream(stream, payload, benchCtx, &counter, s)
+			}(streams[i])
+		}
+		wg.Wait()
+		elapsed := time.Since(start)
+		s.report(atomic.LoadInt64(&counter), elapsed)
+	} else {
+		benchCtx, benchCancel := context.WithTimeout(context.Background(), *duration)
+		defer benchCancel()
+
+		start := time.Now()
+		for i := 0; i < *flows; i++ {
+			wg.Add(1)
+			go func(c pb.BenchClient) {
+				defer wg.Done()
+				runUnary(&c, payload, benchCtx, &counter, s)
+			}(clients[i])
+		}
+		wg.Wait()
+		elapsed := time.Since(start)
+		s.report(atomic.LoadInt64(&counter), elapsed)
+	}
 }
